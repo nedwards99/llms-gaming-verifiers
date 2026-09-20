@@ -22,6 +22,32 @@ from peft import PeftModel
 from transformers import AutoConfig
 
 
+def load_prompt_variants():
+    """Import the inoculation-prompt families from the training repo.
+
+    The families are defined once, in open_instruct/slr/prompt_variants.py, and
+    imported here rather than copied, so that the elicitation rates measured by
+    this script and the prompts used during RL training cannot drift apart.
+    Set SLR_TRAINING_REPO if that checkout is not the sibling directory.
+    """
+    import sys
+    from pathlib import Path
+
+    repo = os.environ.get("SLR_TRAINING_REPO") or str(
+        Path(__file__).resolve().parent.parent / "open-instruct-slurm"
+    )
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    try:
+        from open_instruct.slr.prompt_variants import PROMPT_VARIANTS, apply_variant
+    except ImportError as exc:
+        raise SystemExit(
+            f"Could not import prompt variants from '{repo}'. Point SLR_TRAINING_REPO "
+            f"at your open-instruct checkout. ({exc})"
+        ) from exc
+    return PROMPT_VARIANTS, apply_variant
+
+
 def get_max_seq_length(model_dir, max_seq_length=None, max_new_tokens=None) -> (int, int):
     """Get max sequence length from model config or tokenizer."""
 
@@ -126,6 +152,11 @@ def load_vllm_model(model_path, max_seq_length=8096,
     }
     if distributed_executor_backend:
         args["distributed_executor_backend"] = distributed_executor_backend
+    # NOTE: several branches below hardcode tensor_parallel_size for the
+    # authors' 8-GPU nodes (the generic qwen3 branch sets 4). An explicit
+    # --parallel-size must win, or a single-GPU job dies with
+    # "World size (4) is larger than the number of available GPUs (1)".
+    _explicit_tp = tensor_parallel_size
     if 'DeepSeek-R1' in model_path and 'Qwen3' in model_path:
         # Newer R1 distills on Qwen3 base — use qwen3 parser (tokenizer has <think> tokens)
         args['reasoning_parser'] = 'qwen3'
@@ -197,6 +228,10 @@ def load_vllm_model(model_path, max_seq_length=8096,
         args["seed"] = seed
     print(f"Model path: {model_path} with args: {args}")
     # Initialize vLLM model with spawn-safe settings
+    if _explicit_tp:
+        args['tensor_parallel_size'] = _explicit_tp
+        args.pop('data_parallel_size', None)
+    print(f"vLLM tensor_parallel_size={args['tensor_parallel_size']}")
     llm = LLM(**args)
     print("vLLM model loaded successfully!")
     return llm
@@ -319,7 +354,7 @@ def get_chat_template_kwargs_for_model(model_name: str, enable_thinking: bool, r
 DEFAULT_SEED = 42
 
 
-def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable_thinking=False, cot_phrase: str | None = None, reasoning_effort: str | None = None):
+def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable_thinking=False, cot_phrase: str | None = None, reasoning_effort: str | None = None, prompt_variant: str = "neutral", paraphrase_idx: int = 0, variant_position: str = "prepend", num_samples: int = 1):
     """Evaluate the model using vLLM for fast inference."""
     
     model_name = llm.llm_engine.model_config.model
@@ -331,12 +366,26 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
         reasoning_effort=reasoning_effort,
     )
     print(f"Using chat_template_kwargs: {chat_template_kwargs or '{}'}")
+
+    # Inoculation-prompt variant, wrapped around the task prompt exactly as
+    # slr_bench_prepare_v1 does during training.
+    apply_variant = None
+    if prompt_variant and prompt_variant != "neutral":
+        _, apply_variant = load_prompt_variants()
+        print(f"Applying prompt variant: {prompt_variant} (paraphrase {paraphrase_idx}, {variant_position})")
     
     # Prepare prompts for generation
     formatted_prompts = []
     problem_ids = []
     ground_truths = []
     validation_programs = []
+    # SLR-Bench's schema carries BOTH programs: "validation program" is the
+    # pre-computed isomorphic one, "validation_program_shortcuts" the
+    # extensional one. shortcuts.py needs both -- given only the first it
+    # falls back to its legacy path, treats the isomorphic program as
+    # extensional, and its renamer then no-ops (there is no "(train" in
+    # "(mytrain0"), so both judges agree and the shortcut count is always 0.
+    extensional_programs = []
     
     # Build list of raw prompts (optionally with CoT phrase) and formatted prompts
     input_prompts = []
@@ -345,6 +394,8 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
             raw_prompt = example["prompt"]
         else:
             raw_prompt = example["prompt"]
+        if apply_variant is not None:
+            raw_prompt = apply_variant(raw_prompt, prompt_variant, paraphrase_idx, variant_position)
         if cot_phrase:
             raw_prompt = raw_prompt.rstrip() + "\n\n" + cot_phrase
         # raw_prompt += "\n\n Please enclose the final Prolog rule between [RULE] and [/RULE] tags."
@@ -356,6 +407,7 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
         problem_ids.append(example["id"])
         ground_truths.append(example["ground-truth rule"])
         validation_programs.append(example["validation program"])
+        extensional_programs.append(example.get("validation_program_shortcuts", ""))
     
     # Set up optimized sampling parameters for better logical reasoning
     # Determine stop tokens based on model type
@@ -364,7 +416,10 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
         tokenizer,
         llm,
         reasoning_effort=reasoning_effort,
-        max_tokens=max_new_tokens
+        max_tokens=max_new_tokens,
+        # One sample per prompt makes an elicitation rate very noisy; the
+        # output loop below already records each sample under its own "pass".
+        n=num_samples,
     )
     
     # Alternative: Greedy decoding for deterministic, focused outputs
@@ -422,6 +477,7 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
                 "ground_truth": ground_truths[i],
                 "reference": {
                     "validation_program": validation_programs[i],
+                    "validation_program_shortcuts": extensional_programs[i],
                     "evaluation_config": {
                         "positive_predicate": "eastbound",
                         "negative_predicate": "westbound"
@@ -463,6 +519,23 @@ def main():
                         help="Reasoning effort for supported models (e.g., GPT-OSS).")
     parser.add_argument("--rerun-truncated", action="store_true",
                         help="Re-run only samples that hit the token limit in an existing run, then merge results.")
+    parser.add_argument("--subset-strategy", default="head", choices=["head", "shuffle", "stratified"],
+                        help="How --test-subset picks rows. SLR-Bench is ordered by tier, so 'head' "
+                             "on v1-All returns only Basic problems; 'stratified' spreads the subset "
+                             "evenly across curriculum tiers.")
+    parser.add_argument("--prompt-variant", default="neutral",
+                        help="Inoculation-prompt family from the training repo's PROMPT_VARIANTS "
+                             "(neutral, scope_narrow, scope_broad, permission, goal_redefinition).")
+    parser.add_argument("--paraphrase-idx", type=int, default=0,
+                        help="Which paraphrase within the family to use.")
+    parser.add_argument("--variant-position", default="prepend", choices=["prepend", "append"],
+                        help="Place the instruction before or after the task prompt.")
+    parser.add_argument("--num-samples", type=int, default=1,
+                        help="Samples per prompt. Elicitation rates from a single sample are noisy.")
+    parser.add_argument("--dataset-config", default="v1-All",
+                        help="SLR-Bench config, e.g. v1-Basic for a cheap sweep.")
+    parser.add_argument("--dataset-split", default="test",
+                        help="SLR-Bench split.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (overrides default 42). Appended to output tag to avoid collisions.")
     args = parser.parse_args()
@@ -483,6 +556,16 @@ def main():
         tag += "-CoT"
     if args.reasoning_effort:
         tag += f"-effort-{args.reasoning_effort}"
+    # Variants must not share an output directory, or the second run silently
+    # skips because model_outputs.json already exists.
+    if args.prompt_variant and args.prompt_variant != "neutral":
+        tag += f"-{args.prompt_variant}-p{args.paraphrase_idx}"
+        if args.variant_position != "prepend":
+            tag += f"-{args.variant_position}"
+    else:
+        tag += "-neutral"
+    if args.dataset_config != "v1-All":
+        tag += f"-{args.dataset_config}"
     if args.seed is not None:
         tag += f"-seed{args.seed}"
     if args.out_path:
@@ -548,12 +631,35 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     # Load test dataset
-    print(f"Loading SLR-Bench test dataset...")
-    test_set = load_dataset("AIML-TUDA/SLR-Bench", "v1-All", split="test")
+    print(f"Loading SLR-Bench {args.dataset_config} / {args.dataset_split} ...")
+    test_set = load_dataset("AIML-TUDA/SLR-Bench", args.dataset_config, split=args.dataset_split)
     
     if args.test_subset:
-        print(f"Using subset of {args.test_subset} examples")
-        test_set = test_set.select(range(min(args.test_subset, len(test_set))))
+        n = min(args.test_subset, len(test_set))
+        if args.subset_strategy == "stratified" and "curriculum tier" in test_set.column_names:
+            # Round-robin across tiers so a subset of v1-All is not all Basic.
+            by_tier = {}
+            for i, tier in enumerate(test_set["curriculum tier"]):
+                by_tier.setdefault(tier, []).append(i)
+            picked, pools = [], list(by_tier.values())
+            for rank in range(max(len(p) for p in pools)):
+                for pool in pools:
+                    if rank < len(pool) and len(picked) < n:
+                        picked.append(pool[rank])
+                if len(picked) >= n:
+                    break
+            test_set = test_set.select(sorted(picked))
+            counts = {}
+            for tier in test_set["curriculum tier"]:
+                counts[tier] = counts.get(tier, 0) + 1
+            print(f"Using stratified subset of {len(test_set)} examples: {counts}")
+        elif args.subset_strategy == "shuffle":
+            seed = args.seed if args.seed is not None else DEFAULT_SEED
+            test_set = test_set.shuffle(seed=seed).select(range(n))
+            print(f"Using shuffled subset of {n} examples (seed {seed})")
+        else:
+            test_set = test_set.select(range(n))
+            print(f"Using subset of {n} examples (first {n}, dataset order)")
 
     if truncated_ids is not None:
         test_set = test_set.filter(lambda x: x["id"] in truncated_ids)
@@ -598,6 +704,10 @@ def main():
         enable_thinking=args.enable_thinking,
         cot_phrase=cot_phrase,
         reasoning_effort=args.reasoning_effort,
+        prompt_variant=args.prompt_variant,
+        paraphrase_idx=args.paraphrase_idx,
+        variant_position=args.variant_position,
+        num_samples=args.num_samples,
     )
     
     # add a single top-level metadata file to avoid per-item duplication
@@ -609,6 +719,15 @@ def main():
         "max_new_tokens": max_new_tokens,
         "enable_thinking": args.enable_thinking,
         "reasoning_effort": args.reasoning_effort,
+        "prompt_variant": args.prompt_variant,
+        "paraphrase_idx": args.paraphrase_idx,
+        "variant_position": args.variant_position,
+        "num_samples": args.num_samples,
+        "dataset_config": args.dataset_config,
+        "dataset_split": args.dataset_split,
+        "subset_strategy": args.subset_strategy,
+        "test_subset": args.test_subset,
+        "seed": args.seed,
     }
 
     # Merge with existing outputs if doing a partial rerun
