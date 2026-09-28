@@ -66,11 +66,22 @@ def get_max_seq_length(model_dir, max_seq_length=None, max_new_tokens=None) -> (
         except Exception as e:
             print(f"Could not determine max sequence length from model config: {e}")
     max_seq_length = min(max_seq_length, 200000)
+    # tokenizer.model_max_length can exceed what the model can actually attend over
+    # (Qwen3-4B: 131072 vs max_position_embeddings=40960). With
+    # VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 the engine starts anyway and then dies mid-sweep the
+    # first time a sequence passes the real limit: "Assertion index out of bounds:
+    # 0 <= tmp16 < 40960" and a fatal EngineCore error (job 699455, and 697216 before it).
+    # So clamp to the model's own limit, and leave room for the longest prompts (SLR-Bench
+    # Hard runs to ~12k tokens) rather than letting generation fill the whole window.
+    try:
+        positions = getattr(AutoConfig.from_pretrained(model_dir), "max_position_embeddings", None)
+        if positions and positions < max_seq_length:
+            print(f"Clamping max_seq_length {max_seq_length} -> {positions} (model's max_position_embeddings)")
+            max_seq_length = positions
+    except Exception as e:
+        print(f"Could not read max_position_embeddings: {e}")
     if max_new_tokens is None:
-        # if "deepseek" in model_dir.lower():
-        #     max_new_tokens = 4000
-        # else:
-        max_new_tokens = max_seq_length
+        max_new_tokens = max(4096, max_seq_length - 12288)
     # Default fallback
     return max_seq_length, max_new_tokens
 
@@ -478,14 +489,27 @@ def evaluate_model_vllm(llm, tokenizer, test_dataset, max_new_tokens=512, enable
                 "reference": {
                     "validation_program": validation_programs[i],
                     "validation_program_shortcuts": extensional_programs[i],
-                    "evaluation_config": {
-                        "positive_predicate": "eastbound",
-                        "negative_predicate": "westbound"
-                    }
+                    "evaluation_config": infer_eval_config(ground_truths[i], extensional_programs[i])
                 }
         })
     print(f"Number of outputs exceeding max_new_tokens ({max_new_tokens}): {exceeded_count}/{len(test_dataset)}")
     return model_outputs
+
+def infer_eval_config(ground_truth_rule: str, extensional_program: str) -> dict:
+    """Which predicate marks a positive example, and which a negative one.
+
+    English SLR-Bench uses eastbound/westbound, but the other releases localise the
+    Prolog too (German ost/west, Italian est/ovest, SLR-Homes modern/...), so the
+    English names would score every answer as wrong. The positive predicate is the
+    head of the ground-truth rule; the negative one is the other predicate appearing
+    as a ground fact of a single argument.
+    """
+    positive = ground_truth_rule.split("(")[0].strip() if "(" in (ground_truth_rule or "") else "eastbound"
+    for name in re.findall(r"(?m)^\s*([a-z_][a-zA-Z0-9_]*)\([^,()]*\)\s*\.", extensional_program or ""):
+        if name and name != positive:
+            return {"positive_predicate": positive, "negative_predicate": name}
+    return {"positive_predicate": positive, "negative_predicate": "westbound"}
+
 
 def main():
     """Main evaluation function using vLLM."""
@@ -532,6 +556,10 @@ def main():
                         help="Place the instruction before or after the task prompt.")
     parser.add_argument("--num-samples", type=int, default=1,
                         help="Samples per prompt. Elicitation rates from a single sample are noisy.")
+    parser.add_argument("--dataset-name", default="AIML-TUDA/SLR-Bench",
+                        help="Any SLR release: -German, -Italian, ... or AIML-TUDA/SLR-Homes with "
+                             "--dataset-config default. Predicates are read per problem, so the "
+                             "releases that localise the Prolog (est/ovest, ost/west) score correctly.")
     parser.add_argument("--dataset-config", default="v1-All",
                         help="SLR-Bench config, e.g. v1-Basic for a cheap sweep.")
     parser.add_argument("--dataset-split", default="test",
@@ -564,6 +592,11 @@ def main():
             tag += f"-{args.variant_position}"
     else:
         tag += "-neutral"
+    # The release goes in the tag: without it, one model evaluated on German and then Italian
+    # writes both into the same folder, and a run whose model_outputs.json already exists is
+    # skipped -- so the second would silently never happen.
+    if args.dataset_name != "AIML-TUDA/SLR-Bench":
+        tag += f"-{args.dataset_name.split('/')[-1].replace('SLR-Bench-', '').replace('SLR-', '')}"
     if args.dataset_config != "v1-All":
         tag += f"-{args.dataset_config}"
     if args.seed is not None:
@@ -632,14 +665,20 @@ def main():
 
     # Load test dataset
     print(f"Loading SLR-Bench {args.dataset_config} / {args.dataset_split} ...")
-    test_set = load_dataset("AIML-TUDA/SLR-Bench", args.dataset_config, split=args.dataset_split)
+    test_set = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
     
     if args.test_subset:
         n = min(args.test_subset, len(test_set))
-        if args.subset_strategy == "stratified" and "curriculum tier" in test_set.column_names:
-            # Round-robin across tiers so a subset of v1-All is not all Basic.
+        # SLR-Homes has no "curriculum tier" but does carry "level" (1-10, 50 problems each),
+        # and without a stratum column this fell through to the first N rows: an evaluation of
+        # levels 1-4 only, where a problem has 2 houses, i.e. ONE positive example -- so any
+        # over-specific rule satisfies the weak verifier and is counted as a shortcut. That is
+        # the whole reason its shortcut rate looked elevated.
+        strata_col = next((c for c in ("curriculum tier", "level") if c in test_set.column_names), None)
+        if args.subset_strategy == "stratified" and strata_col:
+            # Round-robin across strata so a subset of v1-All is not all Basic.
             by_tier = {}
-            for i, tier in enumerate(test_set["curriculum tier"]):
+            for i, tier in enumerate(test_set[strata_col]):
                 by_tier.setdefault(tier, []).append(i)
             picked, pools = [], list(by_tier.values())
             for rank in range(max(len(p) for p in pools)):
@@ -650,9 +689,9 @@ def main():
                     break
             test_set = test_set.select(sorted(picked))
             counts = {}
-            for tier in test_set["curriculum tier"]:
+            for tier in test_set[strata_col]:
                 counts[tier] = counts.get(tier, 0) + 1
-            print(f"Using stratified subset of {len(test_set)} examples: {counts}")
+            print(f"Using stratified subset of {len(test_set)} examples by {strata_col!r}: {counts}")
         elif args.subset_strategy == "shuffle":
             seed = args.seed if args.seed is not None else DEFAULT_SEED
             test_set = test_set.shuffle(seed=seed).select(range(n))

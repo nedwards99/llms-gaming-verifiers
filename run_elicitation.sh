@@ -59,6 +59,11 @@ unset REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
 # Qwen3_5ForConditionalGeneration and the image's vLLM registry knows only up
 # to Qwen3NextForCausalLM. Using one needs a newer vLLM, i.e. a new image.
 MODEL="${MODEL:-Qwen/Qwen3-4B}"
+# Any SLR release: AIML-TUDA/SLR-Bench-German / -Italian / ..., or AIML-TUDA/SLR-Homes with
+# DATASET_CONFIG=default. The translated releases localise the Prolog as well as the prose
+# (German ost/west, Italian est/ovest), and evaluate_model_vllm.py reads the predicates per
+# problem, so they score correctly and the release name lands in the output folder.
+DATASET_NAME="${DATASET_NAME:-AIML-TUDA/SLR-Bench}"
 DATASET_CONFIG="${DATASET_CONFIG:-v1-All}"
 DATASET_SPLIT="${DATASET_SPLIT:-test}"
 TEST_SUBSET="${TEST_SUBSET:-200}"
@@ -89,6 +94,7 @@ for family in ${FAMILIES}; do
     echo "--- ${family} ---"
     python evaluate_model_vllm.py \
         --model "${MODEL}" \
+        --dataset-name "${DATASET_NAME}" \
         --dataset-config "${DATASET_CONFIG}" \
         --dataset-split "${DATASET_SPLIT}" \
         --test-subset "${TEST_SUBSET}" \
